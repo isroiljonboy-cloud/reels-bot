@@ -454,8 +454,11 @@ async def main():
     )
 
     print("✅ Maslahatchi ish rejasi boti ishga tushdi!")
-    await app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    print("🟢 Polling boshlandi.")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
