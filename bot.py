@@ -1,460 +1,445 @@
-import os
-import json
-import asyncio
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
-)
+const { Telegraf, Markup } = require('telegraf');
+const fs = require('fs');
+const path = require('path');
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TOKEN = os.environ["BOT_TOKEN"]
-TZ = ZoneInfo("Asia/Tashkent")
-DB_FILE = "data.json"
+const TOKEN = process.env.BOT_TOKEN;
+const DB_FILE = path.join(__dirname, 'data.json');
+const TZ = 'Asia/Tashkent';
 
-# Vazifa turlari
-TASK_TYPES = {
-    "dars": "📚 Dars / Mashg'ulot",
-    "suhbat": "🗣 O'quvchi suhbati",
-    "hujjat": "📝 Hujjat / Vazifa",
-    "uchrashuv": "🤝 Uchrashuv",
-    "boshqa": "📌 Boshqa",
+const bot = new Telegraf(TOKEN);
+
+// ── DB helpers ────────────────────────────────────────────────────────────────
+function loadDB() {
+  if (!fs.existsSync(DB_FILE)) return {};
+  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 }
 
-# Status
-STATUS = {
-    "kutmoqda": "⏳ Kutmoqda",
-    "bajarildi": "✅ Bajarildi",
-    "kechikdi": "⚠️ Kechikdi",
+function saveDB(db) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8');
 }
 
-# Conversation states
-ASK_TYPE, ASK_TITLE, ASK_TIME, ASK_NOTE = range(4)
+function getUser(db, uid) {
+  uid = String(uid);
+  if (!db[uid]) db[uid] = { tasks: [] };
+  return db[uid];
+}
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-def load_db():
-    if not os.path.exists(DB_FILE):
-        return {}
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+function nowTZ() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: TZ }));
+}
 
-def save_db(db):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+function fmtTime(isoStr) {
+  const dt = new Date(isoStr);
+  const days = ['Yakshanba','Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba'];
+  const months = ['Yanvar','Fevral','Mart','Aprel','May','Iyun','Iyul','Avgust','Sentabr','Oktabr','Noyabr','Dekabr'];
+  const local = new Date(dt.toLocaleString('en-US', { timeZone: TZ }));
+  const h = String(local.getHours()).padStart(2, '0');
+  const m = String(local.getMinutes()).padStart(2, '0');
+  return `${days[local.getDay()]}, ${local.getDate()} ${months[local.getMonth()]} • ${h}:${m}`;
+}
 
-def get_user(db, uid):
-    uid = str(uid)
-    if uid not in db:
-        db[uid] = {"tasks": []}
-    return db[uid]
+function parseTime(text) {
+  text = text.trim();
+  const now = nowTZ();
 
-def now_tz():
-    return datetime.now(TZ)
+  // HH:MM
+  let match = text.match(/^(\d{1,2})[:\.](\d{2})$/);
+  if (match) {
+    const d = new Date(now);
+    d.setHours(parseInt(match[1]), parseInt(match[2]), 0, 0);
+    return d;
+  }
 
-def fmt_time(iso_str):
-    dt = datetime.fromisoformat(iso_str)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TZ)
-    days = ["Dushanba","Seshanba","Chorshanba","Payshanba","Juma","Shanba","Yakshanba"]
-    months = ["Yanvar","Fevral","Mart","Aprel","May","Iyun","Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"]
-    return f"{days[dt.weekday()]}, {dt.day} {months[dt.month-1]} • {dt.strftime('%H:%M')}"
+  // DD.MM.YYYY HH:MM
+  match = text.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})$/);
+  if (match) {
+    return new Date(`${match[3]}-${match[2]}-${match[1]}T${match[4].padStart(2,'0')}:${match[5]}:00`);
+  }
 
-def parse_time(text):
-    """HH:MM formatini bugungi sanaga bog'laydi"""
-    text = text.strip()
-    today = now_tz().date()
-    formats = ["%H:%M", "%H.%M", "%H %M"]
-    for fmt in formats:
-        try:
-            t = datetime.strptime(text, fmt)
-            dt = datetime.combine(today, t.time(), tzinfo=TZ)
-            return dt
-        except ValueError:
-            continue
-    # To'liq format: KK.OO.YYYY SS:MM
-    try:
-        dt = datetime.strptime(text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-        return dt
-    except ValueError:
-        return None
+  return null;
+}
 
-# ── /start ────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 *Assalomu alaykum! Maslahatchi Ish Rejasi botiga xush kelibsiz.*\n\n"
-        "Bu bot sizning kunlik ish jadvalingizni boshqaradi va "
-        "har kuni *07:30* da yangi kun rejasini yuboradi.\n\n"
-        "📌 *Buyruqlar:*\n"
-        "/qosh — Yangi vazifa qo'shish\n"
-        "/bugun — Bugungi ish rejasi\n"
-        "/hafta — Haftalik ko'rinish\n"
-        "/help — Yordam\n"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+const TASK_TYPES = {
+  dars: '📚 Dars / Mashg\'ulot',
+  suhbat: '🗣 O\'quvchi suhbati',
+  hujjat: '📝 Hujjat / Vazifa',
+  uchrashuv: '🤝 Uchrashuv',
+  boshqa: '📌 Boshqa',
+};
 
-# ── /qosh conversation ────────────────────────────────────────────────────────
-async def cmd_qosh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📚 Dars", callback_data="type_dars"),
-            InlineKeyboardButton("🗣 Suhbat", callback_data="type_suhbat"),
-        ],
-        [
-            InlineKeyboardButton("📝 Hujjat", callback_data="type_hujjat"),
-            InlineKeyboardButton("🤝 Uchrashuv", callback_data="type_uchrashuv"),
-        ],
-        [InlineKeyboardButton("📌 Boshqa", callback_data="type_boshqa")],
+// Foydalanuvchi holati (conversation state)
+const userState = {};
+
+// ── /start ────────────────────────────────────────────────────────────────────
+bot.start((ctx) => {
+  ctx.replyWithMarkdown(
+    `👋 *Assalomu alaykum! Maslahatchi Ish Rejasi botiga xush kelibsiz.*\n\n` +
+    `Bu bot sizning kunlik ish jadvalingizni boshqaradi va ` +
+    `har kuni *07:30* da yangi kun rejasini yuboradi.\n\n` +
+    `📌 *Buyruqlar:*\n` +
+    `/qosh — Yangi vazifa qo'shish\n` +
+    `/bugun — Bugungi ish rejasi\n` +
+    `/hafta — Haftalik ko'rinish\n` +
+    `/help — Yordam`
+  );
+});
+
+// ── /qosh ────────────────────────────────────────────────────────────────────
+bot.command('qosh', (ctx) => {
+  const uid = String(ctx.from.id);
+  userState[uid] = { step: 'type' };
+
+  ctx.replyWithMarkdown(
+    '*Vazifa turini tanlang:*',
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback('📚 Dars', 'type_dars'),
+        Markup.button.callback('🗣 Suhbat', 'type_suhbat'),
+      ],
+      [
+        Markup.button.callback('📝 Hujjat', 'type_hujjat'),
+        Markup.button.callback('🤝 Uchrashuv', 'type_uchrashuv'),
+      ],
+      [Markup.button.callback('📌 Boshqa', 'type_boshqa')],
     ])
-    await update.message.reply_text(
-        "*Vazifa turini tanlang:*", reply_markup=kb, parse_mode="Markdown"
-    )
-    return ASK_TYPE
+  );
+});
 
-async def got_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["type"] = q.data.replace("type_", "")
-    type_label = TASK_TYPES[ctx.user_data["type"]]
-    await q.edit_message_text(
-        f"{type_label} tanlandi.\n\n✍️ *Vazifa nomini yuboring:*\n\n"
-        f"_Misol: 9-A sinf bilan individual suhbat_",
-        parse_mode="Markdown"
-    )
-    return ASK_TITLE
+// Vazifa turi tanlandi
+Object.keys(TASK_TYPES).forEach((type) => {
+  bot.action(`type_${type}`, (ctx) => {
+    const uid = String(ctx.from.id);
+    if (!userState[uid]) userState[uid] = {};
+    userState[uid].type = type;
+    userState[uid].step = 'title';
+    ctx.answerCbQuery();
+    ctx.editMessageText(
+      `${TASK_TYPES[type]} tanlandi.\n\n✍️ *Vazifa nomini yuboring:*\n\n_Misol: 9-A sinf bilan individual suhbat_`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+});
 
-async def got_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["title"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🕐 *Vaqtini yuboring:*\n\n"
-        "Format: `SS:MM` — masalan, `10:30`\n"
-        "Yoki to'liq: `15.04.2026 14:00`",
-        parse_mode="Markdown"
-    )
-    return ASK_TIME
+// ── /cancel ───────────────────────────────────────────────────────────────────
+bot.command('cancel', (ctx) => {
+  const uid = String(ctx.from.id);
+  delete userState[uid];
+  ctx.reply('❌ Bekor qilindi.');
+});
 
-async def got_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    dt = parse_time(update.message.text)
-    if not dt:
-        await update.message.reply_text(
-            "❌ Format noto'g'ri. Qaytadan yuboring:\n`10:30` yoki `15.04.2026 14:00`",
-            parse_mode="Markdown"
-        )
-        return ASK_TIME
-    ctx.user_data["datetime"] = dt.isoformat()
-    await update.message.reply_text(
-        "📎 *Izoh qo'shing* (ixtiyoriy):\n\n"
-        "Agar izoh kerak bo'lmasa — `/skip` yuboring.",
-        parse_mode="Markdown"
-    )
-    return ASK_NOTE
+// ── /bugun ────────────────────────────────────────────────────────────────────
+bot.command('bugun', (ctx) => {
+  sendDailyPlan(ctx.chat.id, ctx);
+});
 
-async def got_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    ctx.user_data["note"] = "" if text == "/skip" else text
-    return await save_task(update, ctx)
+async function sendDailyPlan(chatId, ctx) {
+  const db = loadDB();
+  const user = getUser(db, chatId);
+  const now = nowTZ();
+  const today = now.toDateString();
 
-async def skip_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["note"] = ""
-    return await save_task(update, ctx)
+  const tasks = user.tasks
+    .filter((t) => new Date(t.datetime).toDateString() === today)
+    .sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
 
-async def save_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    user = get_user(db, update.effective_user.id)
-    task = {
-        "id": int(datetime.now().timestamp() * 1000),
-        "type": ctx.user_data["type"],
-        "title": ctx.user_data["title"],
-        "datetime": ctx.user_data["datetime"],
-        "note": ctx.user_data.get("note", ""),
-        "status": "kutmoqda",
-        "reminded_30m": False,
-        "reminded_now": False,
-        "created_at": now_tz().isoformat(),
+  const days = ['Yakshanba','Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba'];
+  const months = ['Yanvar','Fevral','Mart','Aprel','May','Iyun','Iyul','Avgust','Sentabr','Oktabr','Noyabr','Dekabr'];
+  const dayStr = `${days[now.getDay()]}, ${now.getDate()} ${months[now.getMonth()]}`;
+
+  const header = `📋 *Bugungi ish rejasi*\n📅 ${dayStr}\n${'─'.repeat(28)}\n`;
+
+  const send = (text, extra) => {
+    if (ctx && ctx.replyWithMarkdown) {
+      return ctx.replyWithMarkdown(text, extra);
+    } else {
+      return bot.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown', ...extra });
     }
-    user["tasks"].append(task)
-    save_db(db)
+  };
 
-    emoji = TASK_TYPES[task["type"]].split()[0]
-    await update.message.reply_text(
-        f"✅ *Saqlandi!*\n\n"
-        f"{emoji} *{task['title']}*\n"
-        f"🕐 {fmt_time(task['datetime'])}\n"
-        f"{'📎 ' + task['note'] if task['note'] else ''}",
-        parse_mode="Markdown"
-    )
-    ctx.user_data.clear()
-    return ConversationHandler.END
+  if (!tasks.length) {
+    await send(header + '\n📭 Bugun hali vazifa yo\'q.\n/qosh bilan qo\'shing.');
+    return;
+  }
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Bekor qilindi.")
-    ctx.user_data.clear()
-    return ConversationHandler.END
+  const done = tasks.filter((t) => t.status === 'bajarildi').length;
+  const pending = tasks.length - done;
+  await send(header + `\n📊 Jami: *${tasks.length}* vazifa • ✅ ${done} bajarildi • ⏳ ${pending} kutmoqda`);
 
-# ── /bugun ────────────────────────────────────────────────────────────────────
-async def cmd_bugun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await send_daily_plan(update.effective_chat.id, ctx, update=update)
+  for (const t of tasks) {
+    const dt = new Date(t.datetime);
+    const local = new Date(dt.toLocaleString('en-US', { timeZone: TZ }));
+    const h = String(local.getHours()).padStart(2, '0');
+    const m = String(local.getMinutes()).padStart(2, '0');
+    const emoji = TASK_TYPES[t.type]?.split(' ')[0] || '📌';
+    const overdue = dt < now && t.status === 'kutmoqda';
+    const icon = t.status === 'bajarildi' ? '✅' : overdue ? '⚠️' : '⏳';
 
-async def send_daily_plan(chat_id, ctx, update=None):
-    db = load_db()
-    user = get_user(db, chat_id)
-    now = now_tz()
-    today = now.date()
+    const text = `${icon} ${emoji} *${t.title}*\n🕐 ${h}:${m}${t.note ? `\n📎 _${t.note}_` : ''}`;
 
-    tasks = [
-        t for t in user["tasks"]
-        if datetime.fromisoformat(t["datetime"]).replace(tzinfo=TZ).date() == today
-    ]
-    tasks.sort(key=lambda x: x["datetime"])
+    if (t.status !== 'bajarildi') {
+      await send(text, Markup.inlineKeyboard([
+        [
+          Markup.button.callback('✅ Bajarildi', `done_${t.id}`),
+          Markup.button.callback('⏰ Kechikdi', `late_${t.id}`),
+          Markup.button.callback('🗑 O\'chir', `del_${t.id}`),
+        ],
+      ]));
+    } else {
+      await send(text);
+    }
+  }
+}
 
-    done = [t for t in tasks if t["status"] == "bajarildi"]
-    pending = [t for t in tasks if t["status"] != "bajarildi"]
+// ── /hafta ────────────────────────────────────────────────────────────────────
+bot.command('hafta', (ctx) => {
+  const db = loadDB();
+  const user = getUser(db, ctx.from.id);
+  const now = nowTZ();
+  const weekLater = new Date(now);
+  weekLater.setDate(weekLater.getDate() + 7);
 
-    day_names = ["Dushanba","Seshanba","Chorshanba","Payshanba","Juma","Shanba","Yakshanba"]
-    months = ["Yanvar","Fevral","Mart","Aprel","May","Iyun","Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"]
-    day_str = f"{day_names[today.weekday()]}, {today.day} {months[today.month-1]}"
+  const days = ['Yakshanba','Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba'];
 
-    header = (
-        f"📋 *Bugungi ish rejasi*\n"
-        f"📅 {day_str}\n"
-        f"{'─' * 28}\n"
-    )
+  const tasks = user.tasks
+    .filter((t) => {
+      const d = new Date(t.datetime);
+      return d >= now && d <= weekLater;
+    })
+    .sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
 
-    if not tasks:
-        msg = header + "\n📭 Bugun hali vazifa yo'q.\n/qosh bilan qo'shing."
-        if update:
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        else:
-            await ctx.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        return
+  if (!tasks.length) {
+    ctx.reply('📭 Keyingi 7 kunda rejalashtirilgan vazifa yo\'q.\n/qosh bilan qo\'shing.');
+    return;
+  }
 
-    summary = f"📊 Jami: *{len(tasks)}* vazifa • ✅ {len(done)} bajarildi • ⏳ {len(pending)} kutmoqda\n\n"
+  let text = `📅 *Haftalik reja* (${tasks.length} ta vazifa)\n`;
+  let currentDay = null;
 
-    if update:
-        await update.message.reply_text(header + summary, parse_mode="Markdown")
-    else:
-        await ctx.bot.send_message(chat_id=chat_id, text=header + summary, parse_mode="Markdown")
+  for (const t of tasks) {
+    const dt = new Date(t.datetime);
+    const local = new Date(dt.toLocaleString('en-US', { timeZone: TZ }));
+    const dayName = days[local.getDay()];
+    const h = String(local.getHours()).padStart(2, '0');
+    const m = String(local.getMinutes()).padStart(2, '0');
+    const emoji = TASK_TYPES[t.type]?.split(' ')[0] || '📌';
+    const icon = t.status === 'bajarildi' ? '✅' : '⏳';
 
-    for t in tasks:
-        dt = datetime.fromisoformat(t["datetime"]).replace(tzinfo=TZ)
-        emoji = TASK_TYPES[t["type"]].split()[0]
-        overdue = dt < now and t["status"] == "kutmoqda"
-        status_icon = "✅" if t["status"] == "bajarildi" else ("⚠️" if overdue else "⏳")
+    if (dayName !== currentDay) {
+      currentDay = dayName;
+      text += `\n📌 *${dayName}* — ${local.getDate()}.${String(local.getMonth()+1).padStart(2,'0')}\n`;
+    }
+    text += `  ${icon} ${emoji} \`${h}:${m}\` ${t.title}\n`;
+  }
 
-        text = (
-            f"{status_icon} {emoji} *{t['title']}*\n"
-            f"🕐 {dt.strftime('%H:%M')}"
-            + (f"\n📎 _{t['note']}_" if t["note"] else "")
-        )
+  ctx.replyWithMarkdown(text);
+});
 
-        if t["status"] != "bajarildi":
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Bajarildi", callback_data=f"done_{t['id']}"),
-                    InlineKeyboardButton("⏰ Kechikdi", callback_data=f"late_{t['id']}"),
-                    InlineKeyboardButton("🗑 O'chir", callback_data=f"del_{t['id']}"),
-                ]
-            ])
-        else:
-            kb = None
+// ── Callback: done / late / del ───────────────────────────────────────────────
+bot.action(/^done_(.+)$/, (ctx) => {
+  const id = parseInt(ctx.match[1]);
+  const db = loadDB();
+  const user = getUser(db, ctx.from.id);
+  const task = user.tasks.find((t) => t.id === id);
+  if (task) {
+    task.status = 'bajarildi';
+    saveDB(db);
+    ctx.answerCbQuery('✅ Bajarildi!');
+    ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    ctx.replyWithMarkdown(`✅ *${task.title}* — bajarildi deb belgilandi!`);
+  }
+});
 
-        if update:
-            await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
-        else:
-            await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode="Markdown")
+bot.action(/^late_(.+)$/, (ctx) => {
+  const id = parseInt(ctx.match[1]);
+  const db = loadDB();
+  const user = getUser(db, ctx.from.id);
+  const task = user.tasks.find((t) => t.id === id);
+  if (task) {
+    task.status = 'kechikdi';
+    saveDB(db);
+    ctx.answerCbQuery('⚠️ Kechikdi');
+    ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    ctx.replyWithMarkdown(`⚠️ *${task.title}* — kechikdi deb belgilandi.`);
+  }
+});
 
-# ── /hafta ────────────────────────────────────────────────────────────────────
-async def cmd_hafta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    user = get_user(db, update.effective_user.id)
-    now = now_tz()
-    week_end = now + timedelta(days=7)
-    day_names = ["Dushanba","Seshanba","Chorshanba","Payshanba","Juma","Shanba","Yakshanba"]
+bot.action(/^del_(.+)$/, (ctx) => {
+  const id = parseInt(ctx.match[1]);
+  const db = loadDB();
+  const user = getUser(db, ctx.from.id);
+  const before = user.tasks.length;
+  user.tasks = user.tasks.filter((t) => t.id !== id);
+  if (user.tasks.length < before) {
+    saveDB(db);
+    ctx.answerCbQuery('🗑 O\'chirildi');
+    ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    ctx.reply('🗑 Vazifa o\'chirildi.');
+  }
+});
 
-    week_tasks = [
-        t for t in user["tasks"]
-        if now.date() <= datetime.fromisoformat(t["datetime"]).replace(tzinfo=TZ).date() <= week_end.date()
-    ]
-    week_tasks.sort(key=lambda x: x["datetime"])
+// ── Matn xabarlari (conversation) ─────────────────────────────────────────────
+bot.on('text', (ctx) => {
+  const uid = String(ctx.from.id);
+  const state = userState[uid];
+  if (!state) return;
 
-    if not week_tasks:
-        await update.message.reply_text(
-            "📭 Keyingi 7 kunda rejalashtirilgan vazifa yo'q.\n/qosh bilan qo'shing."
-        )
-        return
+  const text = ctx.message.text.trim();
 
-    text = f"📅 *Haftalik reja* ({len(week_tasks)} ta vazifa)\n\n"
-    current_day = None
+  if (state.step === 'title') {
+    state.title = text;
+    state.step = 'time';
+    ctx.replyWithMarkdown(
+      '🕐 *Vaqtini yuboring:*\n\n' +
+      'Format: `SS:MM` — masalan, `10:30`\n' +
+      'Yoki to\'liq: `15.04.2026 14:00`'
+    );
+    return;
+  }
 
-    for t in week_tasks:
-        dt = datetime.fromisoformat(t["datetime"]).replace(tzinfo=TZ)
-        day = day_names[dt.weekday()]
-        if day != current_day:
-            current_day = day
-            text += f"\n📌 *{day}* — {dt.strftime('%d.%m')}\n"
-        emoji = TASK_TYPES[t["type"]].split()[0]
-        status = "✅" if t["status"] == "bajarildi" else "⏳"
-        text += f"  {status} {emoji} `{dt.strftime('%H:%M')}` {t['title']}\n"
+  if (state.step === 'time') {
+    const dt = parseTime(text);
+    if (!dt) {
+      ctx.replyWithMarkdown('❌ Format noto\'g\'ri. Qaytadan yuboring:\n`10:30` yoki `15.04.2026 14:00`');
+      return;
+    }
+    state.datetime = dt.toISOString();
+    state.step = 'note';
+    ctx.replyWithMarkdown(
+      '📎 *Izoh qo\'shing* (ixtiyoriy):\n\nIzoh kerak bo\'lmasa — `/skip` yuboring.'
+    );
+    return;
+  }
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+  if (state.step === 'note') {
+    state.note = text === '/skip' ? '' : text;
+    saveTask(ctx, uid);
+  }
+});
 
-# ── Callbacks ─────────────────────────────────────────────────────────────────
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
+// /skip buyrug'i
+bot.command('skip', (ctx) => {
+  const uid = String(ctx.from.id);
+  const state = userState[uid];
+  if (state && state.step === 'note') {
+    state.note = '';
+    saveTask(ctx, uid);
+  }
+});
 
-    db = load_db()
-    user = get_user(db, update.effective_user.id)
+function saveTask(ctx, uid) {
+  const state = userState[uid];
+  const db = loadDB();
+  const user = getUser(db, uid);
 
-    if data.startswith("done_"):
-        tid = int(data.replace("done_", ""))
-        for t in user["tasks"]:
-            if t["id"] == tid:
-                t["status"] = "bajarildi"
-                save_db(db)
-                await q.edit_message_reply_markup(reply_markup=None)
-                await q.message.reply_text(
-                    f"✅ *{t['title']}* — bajarildi deb belgilandi!", parse_mode="Markdown"
-                )
-                return
+  const task = {
+    id: Date.now(),
+    type: state.type,
+    title: state.title,
+    datetime: state.datetime,
+    note: state.note || '',
+    status: 'kutmoqda',
+    reminded30m: false,
+    remindedNow: false,
+    createdAt: new Date().toISOString(),
+  };
 
-    elif data.startswith("late_"):
-        tid = int(data.replace("late_", ""))
-        for t in user["tasks"]:
-            if t["id"] == tid:
-                t["status"] = "kechikdi"
-                save_db(db)
-                await q.edit_message_reply_markup(reply_markup=None)
-                await q.message.reply_text(
-                    f"⚠️ *{t['title']}* — kechikdi deb belgilandi.", parse_mode="Markdown"
-                )
-                return
+  user.tasks.push(task);
+  saveDB(db);
+  delete userState[uid];
 
-    elif data.startswith("del_"):
-        tid = int(data.replace("del_", ""))
-        before = len(user["tasks"])
-        user["tasks"] = [t for t in user["tasks"] if t["id"] != tid]
-        if len(user["tasks"]) < before:
-            save_db(db)
-            await q.edit_message_reply_markup(reply_markup=None)
-            await q.message.reply_text("🗑 Vazifa o'chirildi.")
+  const emoji = TASK_TYPES[task.type]?.split(' ')[0] || '📌';
+  ctx.replyWithMarkdown(
+    `✅ *Saqlandi!*\n\n` +
+    `${emoji} *${task.title}*\n` +
+    `🕐 ${fmtTime(task.datetime)}` +
+    (task.note ? `\n📎 ${task.note}` : '')
+  );
+}
 
-# ── Reminder job ──────────────────────────────────────────────────────────────
-async def send_reminders(ctx: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    now = now_tz()
-    for uid, user in db.items():
-        for t in user["tasks"]:
-            if t["status"] == "bajarildi":
-                continue
-            dt = datetime.fromisoformat(t["datetime"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
-            diff_min = (dt - now).total_seconds() / 60
-            emoji = TASK_TYPES[t["type"]].split()[0]
+// ── /help ─────────────────────────────────────────────────────────────────────
+bot.command('help', (ctx) => {
+  ctx.replyWithMarkdown(
+    `📖 *Yordam*\n\n` +
+    `/qosh — Yangi vazifa qo'shish\n` +
+    `/bugun — Bugungi ish rejasi\n` +
+    `/hafta — Keyingi 7 kunlik ko'rinish\n\n` +
+    `📌 *Vazifa turlari:*\n` +
+    `📚 Dars / Mashg'ulot\n` +
+    `🗣 O'quvchi suhbati\n` +
+    `📝 Hujjat / Vazifa\n` +
+    `🤝 Uchrashuv\n` +
+    `📌 Boshqa\n\n` +
+    `⏰ *Eslatmalar:*\n` +
+    `• Har kuni *07:30* da kunlik reja\n` +
+    `• Har bir vazifadan *30 daqiqa* oldin\n` +
+    `• Aynan *vaqtida* eslatma\n\n` +
+    `✅ Har bir vazifani *Bajarildi* yoki *Kechikdi* deb belgilashingiz mumkin.`
+  );
+});
 
-            # 30 daqiqa oldin
-            if 28 <= diff_min <= 32 and not t.get("reminded_30m"):
-                await ctx.bot.send_message(
-                    chat_id=int(uid),
-                    text=(
-                        f"⏰ *30 daqiqadan keyin:*\n\n"
-                        f"{emoji} *{t['title']}*\n"
-                        f"🕐 {dt.strftime('%H:%M')}"
-                        + (f"\n📎 _{t['note']}_" if t.get("note") else "")
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Bajarildi", callback_data=f"done_{t['id']}"),
-                    ]])
-                )
-                t["reminded_30m"] = True
+// ── Eslatmalar (har 1 daqiqada) ───────────────────────────────────────────────
+setInterval(() => {
+  const db = loadDB();
+  const now = nowTZ();
 
-            # Aynan vaqtida
-            elif -2 <= diff_min <= 2 and not t.get("reminded_now"):
-                await ctx.bot.send_message(
-                    chat_id=int(uid),
-                    text=(
-                        f"🔔 *Hozir vaqt keldi!*\n\n"
-                        f"{emoji} *{t['title']}*\n"
-                        f"🕐 {dt.strftime('%H:%M')}"
-                        + (f"\n📎 _{t['note']}_" if t.get("note") else "")
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Bajarildi", callback_data=f"done_{t['id']}"),
-                        InlineKeyboardButton("⏰ Kechikdi", callback_data=f"late_{t['id']}"),
-                    ]])
-                )
-                t["reminded_now"] = True
+  for (const [uid, user] of Object.entries(db)) {
+    for (const t of user.tasks) {
+      if (t.status === 'bajarildi') continue;
 
-    save_db(db)
+      const dt = new Date(t.datetime);
+      const diffMin = (dt - now) / 60000;
+      const emoji = TASK_TYPES[t.type]?.split(' ')[0] || '📌';
 
-# ── Ertalabki kunlik reja job (07:30) ─────────────────────────────────────────
-async def morning_plan_job(ctx: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    for uid in db:
-        await send_daily_plan(int(uid), ctx)
+      // 30 daqiqa oldin
+      if (diffMin >= 28 && diffMin <= 32 && !t.reminded30m) {
+        bot.telegram.sendMessage(
+          uid,
+          `⏰ *30 daqiqadan keyin:*\n\n${emoji} *${t.title}*\n🕐 ${fmtTime(t.datetime)}` +
+          (t.note ? `\n📎 _${t.note}_` : ''),
+          {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.callback('✅ Bajarildi', `done_${t.id}`)]]),
+          }
+        ).catch(() => {});
+        t.reminded30m = true;
+      }
 
-# ── /help ─────────────────────────────────────────────────────────────────────
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Yordam*\n\n"
-        "/qosh — Yangi vazifa qo'shish\n"
-        "/bugun — Bugungi ish rejasi\n"
-        "/hafta — Keyingi 7 kunlik ko'rinish\n\n"
-        "📌 *Vazifa turlari:*\n"
-        "📚 Dars / Mashg'ulot\n"
-        "🗣 O'quvchi suhbati\n"
-        "📝 Hujjat / Vazifa\n"
-        "🤝 Uchrashuv\n"
-        "📌 Boshqa\n\n"
-        "⏰ *Eslatmalar:*\n"
-        "• Har kuni *07:30* da kunlik reja\n"
-        "• Har bir vazifadan *30 daqiqa* oldin\n"
-        "• Aynan *vaqtida* eslatma\n\n"
-        "✅ Har bir vazifani *Bajarildi* yoki *Kechikdi* deb belgilashingiz mumkin.",
-        parse_mode="Markdown"
-    )
+      // Aynan vaqtida
+      if (diffMin >= -2 && diffMin <= 2 && !t.remindedNow) {
+        bot.telegram.sendMessage(
+          uid,
+          `🔔 *Hozir vaqt keldi!*\n\n${emoji} *${t.title}*\n🕐 ${fmtTime(t.datetime)}` +
+          (t.note ? `\n📎 _${t.note}_` : ''),
+          {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[
+              Markup.button.callback('✅ Bajarildi', `done_${t.id}`),
+              Markup.button.callback('⏰ Kechikdi', `late_${t.id}`),
+            ]]),
+          }
+        ).catch(() => {});
+        t.remindedNow = true;
+      }
+    }
+  }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    app = Application.builder().token(TOKEN).build()
+  saveDB(db);
+}, 60000);
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("qosh", cmd_qosh)],
-        states={
-            ASK_TYPE: [CallbackQueryHandler(got_type, pattern="^type_")],
-            ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_title)],
-            ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_time)],
-            ASK_NOTE: [
-                CommandHandler("skip", skip_note),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, got_note),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+// ── Ertalabki reja (07:30 Tashkent) ──────────────────────────────────────────
+setInterval(() => {
+  const now = nowTZ();
+  if (now.getHours() === 7 && now.getMinutes() === 30) {
+    const db = loadDB();
+    for (const uid of Object.keys(db)) {
+      sendDailyPlan(uid, null);
+    }
+  }
+}, 60000);
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("bugun", cmd_bugun))
-    app.add_handler(CommandHandler("hafta", cmd_hafta))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(handle_callback))
+// ── Start ─────────────────────────────────────────────────────────────────────
+bot.launch();
+console.log('✅ Bot ishga tushdi!');
 
-    # Har 1 daqiqada eslatmalarni tekshir
-    app.job_queue.run_repeating(send_reminders, interval=60, first=10)
-
-    # Har kuni 07:30 da kunlik reja
-    app.job_queue.run_daily(
-        morning_plan_job,
-        time=datetime.strptime("07:30", "%H:%M").replace(tzinfo=TZ).timetz(),
-    )
-
-    print("✅ Maslahatchi ish rejasi boti ishga tushdi!")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
