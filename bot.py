@@ -420,7 +420,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-async def main():
+def main():
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
@@ -454,11 +454,7 @@ async def main():
     )
 
     print("✅ Maslahatchi ish rejasi boti ishga tushdi!")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    print("🟢 Polling boshlandi.")
-    await asyncio.Event().wait()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
